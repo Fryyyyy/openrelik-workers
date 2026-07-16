@@ -259,7 +259,7 @@ fn main() {
     w.filter("**/*.yara");
     if let Err(err) = w.walk(
         |file_path| {
-            eprintln!("[-] Attempting to parse {}", file_path.display());
+            // eprintln!("[-] Attempting to parse {}", file_path.display());
             let src = fs::read(file_path)
                 .with_context(|| format!("can not read `{}`", file_path.display()))?;
 
