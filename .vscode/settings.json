@@ -1,0 +1,5 @@
+{
+    "rust-analyzer.linkedProjects": [
+        "workers/yara/fraken-x/Cargo.toml"
+    ]
+}

@@ -63,6 +63,8 @@ struct TestOrScan {
 struct ScanState {
     num_scanned_files: AtomicUsize,
     num_matching_files: AtomicUsize,
+    active_io_threads: std::sync::Arc<AtomicUsize>,
+    hanging_io_threads: std::sync::Arc<AtomicUsize>,
     definitions: Vec<(Vec<u8>, String)>,
     users: HashMap<u32, String>,
 }
@@ -72,6 +74,8 @@ impl ScanState {
         Self {
             num_scanned_files: AtomicUsize::new(0),
             num_matching_files: AtomicUsize::new(0),
+            active_io_threads: std::sync::Arc::new(AtomicUsize::new(0)),
+            hanging_io_threads: std::sync::Arc::new(AtomicUsize::new(0)),
             definitions: definitions,
             users: users,
         }
@@ -195,6 +199,32 @@ impl OutputHandler for JsonOutputHandler {
         let _ = output.send(Message::Info(rendered_json));
     }
 }
+fn read_file_with_timeout(
+    path: &Path,
+    timeout: std::time::Duration,
+    state: &ScanState,
+) -> anyhow::Result<Vec<u8>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let path = path.to_path_buf();
+
+    state.active_io_threads.fetch_add(1, Ordering::Relaxed);
+    let active_counter = state.active_io_threads.clone();
+
+    std::thread::spawn(move || {
+        let res = fs::read(path);
+        let _ = tx.send(res);
+        active_counter.fetch_sub(1, Ordering::Relaxed);
+    });
+
+    match rx.recv_timeout(timeout) {
+        Ok(res) => res.map_err(|e| anyhow::anyhow!(e)),
+        Err(_) => {
+            state.hanging_io_threads.fetch_add(1, Ordering::Relaxed);
+            anyhow::bail!("timeout reading file")
+        }
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -291,6 +321,13 @@ fn main() {
             },
             // File handler
             |state, output, file_path, scanner| {
+                // Reset globals first, in case a previous run errored out early
+                scanner.set_global("owner", "")?;
+                scanner.set_global("filepath", "")?;
+                scanner.set_global("filename", "")?;
+                scanner.set_global("extension", "")?;
+                scanner.set_global("filetype", "")?;
+
                 let metadata = fs::metadata(file_path.clone())?;
                 if metadata.len() > cli.maxsize {
                     return Ok(());
@@ -309,20 +346,50 @@ fn main() {
                         .unwrap_or("".to_string()),
                 )?;
 
+                // Read file with timeout to prevent hanging on D-state
+                let data = match read_file_with_timeout(
+                    file_path.as_path(),
+                    std::time::Duration::from_secs(5),
+                    state,
+                ) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        if e.to_string() == "timeout reading file" {
+                            let active = state.active_io_threads.load(Ordering::Relaxed);
+                            let hanging = state.hanging_io_threads.load(Ordering::Relaxed);
+                            let _ = output.send(Message::Error(format!(
+                                "timeout reading {} (active threads: {}, hanging threads: {})",
+                                file_path.display(),
+                                active,
+                                hanging
+                            )));
+                        } else {
+                            let _ = output.send(Message::Error(format!(
+                                "error reading {}: {}",
+                                file_path.display(),
+                                e
+                            )));
+                        }
+                        return Ok(());
+                    }
+                };
+
                 // Magics
-                let target_bytes =
-                // Anyhow
-                    magic::read_first_bytes(file_path.to_str().unwrap_or(""), max_signature_len).unwrap_or(vec![]);
+                let target_bytes = if data.len() > max_signature_len {
+                    data[..max_signature_len].to_vec()
+                } else {
+                    data.clone()
+                };
                 if target_bytes.len() > 0 {
                     for (hex_bytes, description) in &state.definitions {
-                        if target_bytes.starts_with(&hex_bytes) {
+                        if target_bytes.starts_with(hex_bytes) {
                             scanner.set_global("filetype", description.clone())?;
                             break;
                         }
                     }
                 }
 
-                let scan_results = scanner.scan_file(file_path.as_path());
+                let scan_results = scanner.scan(data.as_slice());
                 let scan_results = scan_results?;
                 let matched_count = scan_results.matching_rules().len();
                 let matched = scan_results.matching_rules();
@@ -333,13 +400,6 @@ fn main() {
                 if matched_count > 0 {
                     state.num_matching_files.fetch_add(1, Ordering::Relaxed);
                 }
-
-                // Reset globals
-                scanner.set_global("owner", "")?;
-                scanner.set_global("filepath", "")?;
-                scanner.set_global("filename", "")?;
-                scanner.set_global("extension", "")?;
-                scanner.set_global("filetype", "")?;
 
                 Ok(())
             },

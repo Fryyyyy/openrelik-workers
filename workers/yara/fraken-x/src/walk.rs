@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::{io, thread};
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use crossbeam::channel::{RecvTimeoutError, SendError, Sender};
 use crossterm::tty::IsTty;
 use globwalk::FileType;
